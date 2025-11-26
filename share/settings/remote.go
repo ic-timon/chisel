@@ -226,6 +226,11 @@ func (r Remote) UserAddr() string {
 
 //CanListen checks if the port can be listened on
 func (r Remote) CanListen() bool {
+	// For reverse tunnels, the listening happens on the client side,
+	// so we don't need to check if the server can listen on this port
+	if r.Reverse {
+		return true
+	}
 	//valid protocols
 	switch r.LocalProto {
 	case "tcp":

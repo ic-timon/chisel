@@ -112,9 +112,9 @@ func NewServer(c *Config) (*Server, error) {
 	}
 	//fingerprint this key
 	server.fingerprint = ccrypto.FingerprintKey(private.PublicKey())
-	//create ssh config
+	//create ssh config with masked version string
 	server.sshConfig = &ssh.ServerConfig{
-		ServerVersion:    "SSH-" + chshare.ProtocolVersion + "-server",
+		ServerVersion:    chshare.MaskedSSHServerVersion,
 		PasswordCallback: server.authUser,
 	}
 	server.sshConfig.AddHostKey(private)

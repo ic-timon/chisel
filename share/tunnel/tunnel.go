@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"sync"
 	"time"
@@ -45,13 +46,21 @@ type Tunnel struct {
 	//internals
 	connStats   cnet.ConnCount
 	socksServer *socks5.Server
+	// Enhanced connection management
+	connPool     []ssh.Conn
+	connPoolMut  sync.RWMutex
+	maxPoolSize  int
+	healthCheck  *time.Ticker
+	lastActivity time.Time
 }
 
 //New Tunnel from the given Config
 func New(c Config) *Tunnel {
 	c.Logger = c.Logger.Fork("tun")
 	t := &Tunnel{
-		Config: c,
+		Config:      c,
+		maxPoolSize: 5, // Maximum connection pool size
+		connPool:    make([]ssh.Conn, 0),
 	}
 	t.activatingConn.Add(1)
 	//setup socks server (not listening on any port!)
@@ -63,6 +72,11 @@ func New(c Config) *Tunnel {
 		}
 		t.socksServer, _ = socks5.New(&socks5.Config{Logger: sl})
 		extra += " (SOCKS enabled)"
+	}
+	// Start health check for connection pool
+	if c.KeepAlive > 0 {
+		t.healthCheck = time.NewTicker(c.KeepAlive / 2)
+		go t.connectionPoolHealthCheck()
 	}
 	t.Debugf("Created%s", extra)
 	return t
@@ -94,6 +108,7 @@ func (t *Tunnel) BindSSH(ctx context.Context, c ssh.Conn, reqs <-chan *ssh.Reque
 	go t.handleSSHRequests(reqs)
 	go t.handleSSHChannels(chans)
 	t.Debugf("SSH connected")
+	t.updateLastActivity()
 	err := c.Wait()
 	t.Debugf("SSH disconnected")
 	//mark inactive and block
@@ -129,6 +144,11 @@ func (t *Tunnel) getSSH(ctx context.Context) ssh.Conn {
 		t.activeConnMut.RUnlock()
 		return c
 	}
+}
+
+//IsInbound returns true if this is a client tunnel (inbound)
+func (t *Tunnel) IsInbound() bool {
+	return t.Inbound
 }
 
 func (t *Tunnel) activatingConnWait() <-chan struct{} {
@@ -173,9 +193,26 @@ func (t *Tunnel) BindRemotes(ctx context.Context, remotes []*settings.Remote) er
 }
 
 func (t *Tunnel) keepAliveLoop(sshConn ssh.Conn) {
-	//ping forever
+	//ping forever with randomized intervals
+	//Default: ±30% jitter to make traffic patterns less predictable
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	jitterPercent := 0.30 // 30% jitter (highest level)
+	
 	for {
-		time.Sleep(t.Config.KeepAlive)
+		// Calculate jitter: ±30% of KeepAlive duration
+		baseDuration := float64(t.Config.KeepAlive)
+		jitterRange := baseDuration * jitterPercent
+		// Random value between -jitterRange and +jitterRange
+		jitter := (rng.Float64()*2 - 1) * jitterRange
+		actualDuration := time.Duration(baseDuration + jitter)
+		
+		// Ensure duration is at least 10% of original to avoid too short intervals
+		minDuration := time.Duration(baseDuration * 0.1)
+		if actualDuration < minDuration {
+			actualDuration = minDuration
+		}
+		
+		time.Sleep(actualDuration)
 		_, b, err := sshConn.SendRequest("ping", true, nil)
 		if err != nil {
 			break
@@ -184,7 +221,49 @@ func (t *Tunnel) keepAliveLoop(sshConn ssh.Conn) {
 			t.Debugf("strange ping response")
 			break
 		}
+		t.updateLastActivity()
 	}
 	//close ssh connection on abnormal ping
 	sshConn.Close()
+}
+
+// connectionPoolHealthCheck periodically checks connection pool health
+func (t *Tunnel) connectionPoolHealthCheck() {
+	if t.healthCheck == nil {
+		return
+	}
+	
+	for range t.healthCheck.C {
+		t.connPoolMut.Lock()
+		// Clean up dead connections
+		validConns := make([]ssh.Conn, 0)
+		for _, conn := range t.connPool {
+			if conn != nil && !isConnDead(conn) {
+				validConns = append(validConns, conn)
+			} else {
+				t.Debugf("Removed dead connection from pool")
+			}
+		}
+		t.connPool = validConns
+		t.connPoolMut.Unlock()
+		
+		// Log pool status
+		if t.Logger.Debug {
+			t.Debugf("Connection pool size: %d", len(t.connPool))
+		}
+	}
+}
+
+// updateLastActivity updates the last activity timestamp
+func (t *Tunnel) updateLastActivity() {
+	t.connPoolMut.Lock()
+	t.lastActivity = time.Now()
+	t.connPoolMut.Unlock()
+}
+
+// isConnDead checks if an SSH connection is dead
+func isConnDead(conn ssh.Conn) bool {
+	// Try to send a small ping to check connection health
+	_, _, err := conn.SendRequest("keepalive@openssh.com", true, nil)
+	return err != nil
 }

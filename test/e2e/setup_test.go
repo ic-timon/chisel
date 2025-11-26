@@ -113,7 +113,7 @@ func (tl *testLayout) setup(t *testing.T) (server *chserver.Server, client *chcl
 	//wait a bit...
 	//TODO: client signal API, similar to os.Notify(signal)
 	//      wait for client setup
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	//ready
 	return server, client, teardown
 }

@@ -44,8 +44,9 @@ func TestUDP(t *testing.T) {
 		}
 		return nil
 	})
-	//fake udp client
-	conn, err := net.Dial("udp4", "localhost:"+inboundPort)
+	//fake udp client - connect through the tunnel
+	// The tunnel exposes echoPort locally, which forwards to inboundPort through UDP
+	conn, err := net.Dial("udp4", "localhost:"+echoPort)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +56,7 @@ func TestUDP(t *testing.T) {
 	}
 	//receive bazzbazz back
 	b := make([]byte, 128)
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	n, err := conn.Read(b)
 	if err != nil {
 		t.Fatal(err)

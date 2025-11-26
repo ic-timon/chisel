@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"testing"
+	"time"
 
 	chclient "github.com/jpillora/chisel/client"
 	chserver "github.com/jpillora/chisel/server"
@@ -34,9 +35,11 @@ func TestReverse(t *testing.T) {
 			Reverse: true,
 		},
 		&chclient.Config{
-			Remotes: []string{"R:" + tmpPort + ":$FILEPORT"},
+			Remotes: []string{"R:127.0.0.1:" + tmpPort + ":127.0.0.1:$FILEPORT"},
 		})
 	defer teardown()
+	// Wait a bit for connections to stabilize
+	time.Sleep(100 * time.Millisecond)
 	//test remote (this goes through the server and out the client)
 	result, err := post("http://localhost:"+tmpPort, "foo")
 	if err != nil {

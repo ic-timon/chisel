@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/settings"
@@ -15,6 +16,7 @@ import (
 //sshTunnel exposes a subset of Tunnel to subtypes
 type sshTunnel interface {
 	getSSH(ctx context.Context) ssh.Conn
+	IsInbound() bool
 }
 
 //Proxy is the inbound portion of a Tunnel
@@ -28,21 +30,44 @@ type Proxy struct {
 	tcp    *net.TCPListener
 	udp    *udpListener
 	mu     sync.Mutex
+	// Enhanced connection management
+	connPool     chan struct{}
+	maxConns     int
+	activeConns  int32
+	connStats    *ConnectionStats
+}
+
+// ConnectionStats tracks proxy connection statistics
+type ConnectionStats struct {
+	TotalConnections int64
+	ActiveConnections int32
+	FailedConnections int64
+	BytesSent        int64
+	BytesReceived    int64
 }
 
 //NewProxy creates a Proxy
 func NewProxy(logger *cio.Logger, sshTun sshTunnel, index int, remote *settings.Remote) (*Proxy, error) {
 	id := index + 1
 	p := &Proxy{
-		Logger: logger.Fork("proxy#%s", remote.String()),
-		sshTun: sshTun,
-		id:     id,
-		remote: remote,
+		Logger:    logger.Fork("proxy#%s", remote.String()),
+		sshTun:    sshTun,
+		id:        id,
+		remote:    remote,
+		maxConns:  100, // Maximum concurrent connections
+		connPool:  make(chan struct{}, 100),
+		connStats: &ConnectionStats{},
 	}
 	return p, p.listen()
 }
 
 func (p *Proxy) listen() error {
+	if p.remote.Reverse && !p.sshTun.IsInbound() {
+		// For reverse proxies, we don't listen locally on the server side
+		// The client will listen locally and forward connections through SSH
+		p.Infof("Reverse proxy configured")
+		return nil
+	}
 	if p.remote.Stdio {
 		//TODO check if pipes active?
 	} else if p.remote.LocalProto == "tcp" {
@@ -96,6 +121,13 @@ func (p *Proxy) runStdio(ctx context.Context) error {
 }
 
 func (p *Proxy) runTCP(ctx context.Context) error {
+	if p.remote.Reverse && !p.sshTun.IsInbound() {
+		// For reverse proxies, we don't run TCP listener on the server side
+		// The client will handle the local listening and forwarding
+		<-ctx.Done()
+		return nil
+	}
+	
 	done := make(chan struct{})
 	//implements missing net.ListenContext
 	go func() {
@@ -105,6 +137,12 @@ func (p *Proxy) runTCP(ctx context.Context) error {
 		case <-done:
 		}
 	}()
+	
+	// Use worker pool for better concurrency control
+	for i := 0; i < 10; i++ {
+		go p.connectionWorker(ctx, done)
+	}
+	
 	for {
 		src, err := p.tcp.Accept()
 		if err != nil {
@@ -118,12 +156,41 @@ func (p *Proxy) runTCP(ctx context.Context) error {
 			close(done)
 			return err
 		}
-		go p.pipeRemote(ctx, src)
+		
+		// Use connection pool to limit concurrent connections
+		select {
+		case p.connPool <- struct{}{}:
+			go p.pipeRemote(ctx, src)
+		default:
+			p.Debugf("Connection pool full, rejecting connection")
+			src.Close()
+		}
+	}
+}
+
+// connectionWorker handles connections from the pool
+func (p *Proxy) connectionWorker(ctx context.Context, done chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-p.connPool:
+			// Worker ready for next connection
+		}
 	}
 }
 
 func (p *Proxy) pipeRemote(ctx context.Context, src io.ReadWriteCloser) {
 	defer src.Close()
+	defer func() {
+		// Release connection from pool
+		select {
+		case <-p.connPool:
+		default:
+		}
+	}()
 
 	p.mu.Lock()
 	p.count++
@@ -132,19 +199,32 @@ func (p *Proxy) pipeRemote(ctx context.Context, src io.ReadWriteCloser) {
 
 	l := p.Fork("conn#%d", cid)
 	l.Debugf("Open")
+	
+	// Update connection statistics
+	atomic.AddInt64(&p.connStats.TotalConnections, 1)
+	atomic.AddInt32(&p.connStats.ActiveConnections, 1)
+	defer atomic.AddInt32(&p.connStats.ActiveConnections, -1)
+	
 	sshConn := p.sshTun.getSSH(ctx)
 	if sshConn == nil {
 		l.Debugf("No remote connection")
+		atomic.AddInt64(&p.connStats.FailedConnections, 1)
 		return
 	}
 	//ssh request for tcp connection for this proxy's remote
 	dst, reqs, err := sshConn.OpenChannel("chisel", []byte(p.remote.Remote()))
 	if err != nil {
 		l.Infof("Stream error: %s", err)
+		atomic.AddInt64(&p.connStats.FailedConnections, 1)
 		return
 	}
 	go ssh.DiscardRequests(reqs)
 	//then pipe
 	s, r := cio.Pipe(src, dst)
+	
+	// Update traffic statistics
+	atomic.AddInt64(&p.connStats.BytesSent, s)
+	atomic.AddInt64(&p.connStats.BytesReceived, r)
+	
 	l.Debugf("Close (sent %s received %s)", sizestr.ToString(s), sizestr.ToString(r))
 }

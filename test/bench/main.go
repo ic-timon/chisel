@@ -50,6 +50,15 @@ func run() {
 			test()
 		case "bench":
 			bench()
+		case "compare":
+			// Performance comparison requires two ports: original and enhanced
+			if len(args) < 3 {
+				fatal("Usage: go run main.go compare <original_port> <enhanced_port>")
+			}
+			originalPort := args[1]
+			enhancedPort := args[2]
+			runPerformanceComparison(originalPort, enhancedPort)
+			return
 		}
 	}
 }

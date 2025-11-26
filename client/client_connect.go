@@ -20,17 +20,27 @@ import (
 func (c *Client) connectionLoop(ctx context.Context) error {
 	//connection loop!
 	b := &backoff.Backoff{Max: c.config.MaxRetryInterval}
+	var lastSuccess time.Time
+	var consecutiveFailures int
+	var adaptiveBackoff time.Duration
+	
 	for {
 		connected, err := c.connectionOnce(ctx)
 		//reset backoff after successful connections
 		if connected {
 			b.Reset()
+			lastSuccess = time.Now()
+			consecutiveFailures = 0
+			adaptiveBackoff = 0
+		} else {
+			consecutiveFailures++
 		}
+		
 		//connection error
 		attempt := int(b.Attempt())
 		maxAttempt := c.config.MaxRetryCount
 		//dont print closed-connection errors
-		if strings.HasSuffix(err.Error(), "use of closed network connection") {
+		if err != nil && strings.HasSuffix(err.Error(), "use of closed network connection") {
 			err = io.EOF
 		}
 		//show error message and attempt counts (excluding disconnects)
@@ -50,10 +60,32 @@ func (c *Client) connectionLoop(ctx context.Context) error {
 			c.Infof("Give up")
 			break
 		}
-		d := b.Duration()
-		c.Infof("Retrying in %s...", d)
+		
+		// Adaptive backoff calculation
+		baseDuration := b.Duration()
+		
+		// Increase backoff based on consecutive failures
+		if consecutiveFailures > 3 {
+			adaptiveBackoff = baseDuration * time.Duration(consecutiveFailures/3)
+			if adaptiveBackoff > 10*time.Minute {
+				adaptiveBackoff = 10 * time.Minute
+			}
+		}
+		
+		// Network quality assessment
+		if !lastSuccess.IsZero() && time.Since(lastSuccess) > 5*time.Minute {
+			// If no successful connection for 5 minutes, reduce backoff to probe network
+			adaptiveBackoff = 5 * time.Second
+		}
+		
+		finalBackoff := baseDuration + adaptiveBackoff
+		if finalBackoff > 10*time.Minute {
+			finalBackoff = 10 * time.Minute
+		}
+		
+		c.Infof("Retrying in %s (adaptive: %s)...", finalBackoff, adaptiveBackoff)
 		select {
-		case <-cos.AfterSignal(d):
+		case <-cos.AfterSignal(finalBackoff):
 			continue //retry now
 		case <-ctx.Done():
 			c.Infof("Cancelled")
@@ -76,9 +108,11 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	//prepare dialer
+	// Use masked protocol to hide chisel identity
+	// The actual protocol verification happens via SSH custom request after handshake
 	d := websocket.Dialer{
 		HandshakeTimeout: settings.EnvDuration("WS_TIMEOUT", 45*time.Second),
-		Subprotocols:     []string{chshare.ProtocolVersion},
+		Subprotocols:     []string{chshare.MaskedWebSocketProtocol},
 		TLSClientConfig:  c.tlsConfig,
 		ReadBufferSize:   settings.EnvInt("WS_BUFF_SIZE", 0),
 		WriteBufferSize:  settings.EnvInt("WS_BUFF_SIZE", 0),
@@ -90,8 +124,23 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 			return false, err
 		}
 	}
-	wsConn, _, err := d.DialContext(ctx, c.server, c.config.Headers)
+	
+	// Connection timeout with adaptive strategy
+	connectCtx, connectCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer connectCancel()
+	
+	// Remove Connection header to avoid duplicate with WebSocket library
+	headers := c.config.Headers.Clone()
+	if headers != nil {
+		headers.Del("Connection")
+	}
+	
+	wsConn, _, err := d.DialContext(connectCtx, c.server, headers)
 	if err != nil {
+		// Check for specific error types to adjust strategy
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline") {
+			c.Debugf("Connection timeout, network may be unstable")
+		}
 		return false, err
 	}
 	conn := cnet.NewWebSocketConn(wsConn)

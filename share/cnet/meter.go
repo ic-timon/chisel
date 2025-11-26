@@ -19,33 +19,33 @@ func NewMeter(l *cio.Logger) *Meter {
 //of a reader or writer to measure the
 //throughput
 type Meter struct {
-	//meter state
-	sent, recv int64
+	//meter state - use atomic operations for thread safety
+	sent, recv atomic.Int64
 	//print state
 	l            *cio.Logger
-	printing     uint32
-	last         int64
-	lsent, lrecv int64
+	printing     atomic.Bool
+	last         atomic.Int64
+	lsent, lrecv atomic.Int64
 }
 
 func (m *Meter) print() {
 	//move out of the read/write path asap
-	if atomic.CompareAndSwapUint32(&m.printing, 0, 1) {
+	if m.printing.CompareAndSwap(false, true) {
 		go m.goprint()
 	}
 }
 
 func (m *Meter) goprint() {
 	time.Sleep(time.Second)
-	//snapshot
-	s := atomic.LoadInt64(&m.sent)
-	r := atomic.LoadInt64(&m.recv)
+	//snapshot using atomic operations
+	s := m.sent.Load()
+	r := m.recv.Load()
 	//compute speed
 	curr := time.Now().UnixNano()
-	last := atomic.LoadInt64(&m.last)
+	last := m.last.Load()
 	dt := time.Duration(curr-last) * time.Nanosecond
-	ls := atomic.LoadInt64(&m.lsent)
-	lr := atomic.LoadInt64(&m.lrecv)
+	ls := m.lsent.Load()
+	lr := m.lrecv.Load()
 	//DEBUG
 	// m.l.Infof("%s = %d(%d-%d), %d(%d-%d)", dt, s-ls, s, ls, r-lr, r, lr)
 	//scale to per second V=D/T
@@ -55,11 +55,11 @@ func (m *Meter) goprint() {
 		m.l.Debugf("write %s/s read %s/s", sizestr.ToString(sps), sizestr.ToString(rps))
 	}
 	//record last printed
-	atomic.StoreInt64(&m.lsent, s)
-	atomic.StoreInt64(&m.lrecv, r)
+	m.lsent.Store(s)
+	m.lrecv.Store(r)
 	//done
-	atomic.StoreInt64(&m.last, curr)
-	atomic.StoreUint32(&m.printing, 0)
+	m.last.Store(curr)
+	m.printing.Store(false)
 }
 
 //TeeReader inserts Meter into the read path
@@ -79,7 +79,7 @@ type meterReader struct {
 
 func (m *meterReader) Read(p []byte) (n int, err error) {
 	n, err = m.inner.Read(p)
-	atomic.AddInt64(&m.recv, int64(n))
+	m.recv.Add(int64(n))
 	m.Meter.print()
 	return
 }
@@ -101,7 +101,7 @@ type meterWriter struct {
 
 func (m *meterWriter) Write(p []byte) (n int, err error) {
 	n, err = m.inner.Write(p)
-	atomic.AddInt64(&m.sent, int64(n))
+	m.sent.Add(int64(n))
 	m.Meter.print()
 	return
 }

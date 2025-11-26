@@ -18,18 +18,19 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-//listenUDP is a special listener which forwards packets via
-//the bound ssh connection. tricky part is multiplexing lots of
-//udp clients through the entry node. each will listen on its
-//own source-port for a response:
-//                                                (random)
-//    src-1 1111->...                         dst-1 6345->7777
-//    src-2 2222->... <---> udp <---> udp <-> dst-1 7543->7777
-//    src-3 3333->...    listener    handler  dst-1 1444->7777
+// listenUDP is a special listener which forwards packets via
+// the bound ssh connection. tricky part is multiplexing lots of
+// udp clients through the entry node. each will listen on its
+// own source-port for a response:
 //
-//we must store these mappings (1111-6345, etc) in memory for a length
-//of time, so that when the exit node receives a response on 6345, it
-//knows to return it to 1111.
+//	                                            (random)
+//	src-1 1111->...                         dst-1 6345->7777
+//	src-2 2222->... <---> udp <---> udp <-> dst-1 7543->7777
+//	src-3 3333->...    listener    handler  dst-1 1444->7777
+//
+// we must store these mappings (1111-6345, etc) in memory for a length
+// of time, so that when the exit node receives a response on 6345, it
+// knows to return it to 1111.
 func listenUDP(l *cio.Logger, sshTun sshTunnel, remote *settings.Remote) (*udpListener, error) {
 	a, err := net.ResolveUDPAddr("udp", remote.Local())
 	if err != nil {
@@ -41,11 +42,14 @@ func listenUDP(l *cio.Logger, sshTun sshTunnel, remote *settings.Remote) (*udpLi
 	}
 	//ready
 	u := &udpListener{
-		Logger:  l,
-		sshTun:  sshTun,
-		remote:  remote,
-		inbound: conn,
-		maxMTU:  settings.EnvInt("UDP_MAX_SIZE", 9012),
+		Logger:      l,
+		sshTun:      sshTun,
+		remote:      remote,
+		inbound:     conn,
+		maxMTU:      settings.EnvInt("UDP_MAX_SIZE", 9012),
+		connMap:     &sync.Map{},
+		packetQueue: make(chan *udpPacket, 10000), // Buffer for packet processing
+		stats:       &UDPStats{},
 	}
 	u.Debugf("UDP max size: %d bytes", u.maxMTU)
 	return u, nil
@@ -60,6 +64,20 @@ type udpListener struct {
 	outbound    *udpChannel
 	sent, recv  int64
 	maxMTU      int
+	// Enhanced UDP connection management
+	connMap     *sync.Map
+	packetQueue chan *udpPacket
+	stats       *UDPStats
+}
+
+// UDPStats tracks UDP connection statistics
+type UDPStats struct {
+	PacketsSent     int64
+	PacketsReceived int64
+	BytesSent       int64
+	BytesReceived   int64
+	ActiveChannels  int32
+	FailedPackets   int64
 }
 
 func (u *udpListener) run(ctx context.Context) error {
@@ -74,6 +92,9 @@ func (u *udpListener) run(ctx context.Context) error {
 	eg.Go(func() error {
 		return u.runOutbound(ctx)
 	})
+	eg.Go(func() error {
+		return u.processPacketQueue(ctx)
+	})
 	if err := eg.Wait(); err != nil {
 		u.Debugf("listen: %s", err)
 		return err
@@ -85,8 +106,8 @@ func (u *udpListener) run(ctx context.Context) error {
 func (u *udpListener) runInbound(ctx context.Context) error {
 	buff := make([]byte, u.maxMTU)
 	for !isDone(ctx) {
-		//read from inbound udp
-		u.inbound.SetReadDeadline(time.Now().Add(time.Second))
+		//read from inbound udp - use longer timeout to avoid excessive context switching
+		u.inbound.SetReadDeadline(time.Now().Add(5 * time.Second))
 		n, addr, err := u.inbound.ReadFromUDP(buff)
 		if e, ok := err.(net.Error); ok && (e.Timeout() || e.Temporary()) {
 			continue
@@ -94,24 +115,32 @@ func (u *udpListener) runInbound(ctx context.Context) error {
 		if err != nil {
 			return u.Errorf("read error: %w", err)
 		}
-		//upsert ssh channel
-		uc, err := u.getUDPChan(ctx)
-		if err != nil {
-			if strings.HasSuffix(err.Error(), "EOF") {
-				continue
-			}
-			return u.Errorf("inbound-udpchan: %w", err)
+
+		u.Debugf("Received UDP packet from %s, size: %d bytes", addr.String(), n)
+
+		// Use packet queue for better performance
+		packet := &udpPacket{
+			Src:     addr.String(),
+			Payload: make([]byte, n),
 		}
-		//send over channel, including source address
-		b := buff[:n]
-		if err := uc.encode(addr.String(), b); err != nil {
-			if strings.HasSuffix(err.Error(), "EOF") {
-				continue //dropped packet...
-			}
-			return u.Errorf("encode error: %w", err)
+		copy(packet.Payload, buff[:n])
+
+		select {
+		case u.packetQueue <- packet:
+			// Packet queued successfully
+			u.Debugf("Queued UDP packet from %s", addr.String())
+		case <-ctx.Done():
+			return nil
+		default:
+			// Queue full, drop packet but log warning
+			atomic.AddInt64(&u.stats.FailedPackets, 1)
+			u.Debugf("UDP packet queue full, dropped packet from %s", addr.String())
 		}
+
 		//stats
 		atomic.AddInt64(&u.sent, int64(n))
+		atomic.AddInt64(&u.stats.PacketsSent, 1)
+		atomic.AddInt64(&u.stats.BytesSent, int64(n))
 	}
 	return nil
 }
@@ -145,6 +174,8 @@ func (u *udpListener) runOutbound(ctx context.Context) error {
 		}
 		//stats
 		atomic.AddInt64(&u.recv, int64(n))
+		atomic.AddInt64(&u.stats.PacketsReceived, 1)
+		atomic.AddInt64(&u.stats.BytesReceived, int64(n))
 	}
 	return nil
 }
@@ -170,6 +201,8 @@ func (u *udpListener) getUDPChan(ctx context.Context) (*udpChannel, error) {
 	}
 	go ssh.DiscardRequests(reqs)
 	//remove on disconnect
+	// Track active channels
+	atomic.AddInt32(&u.stats.ActiveChannels, 1)
 	go u.unsetUDPChan(sshConn)
 	//ready
 	o := &udpChannel{
@@ -182,10 +215,59 @@ func (u *udpListener) getUDPChan(ctx context.Context) (*udpChannel, error) {
 	return o, nil
 }
 
+// processPacketQueue handles packets from the queue
+func (u *udpListener) processPacketQueue(ctx context.Context) error {
+	for !isDone(ctx) {
+		select {
+		case <-ctx.Done():
+			return nil
+		case packet := <-u.packetQueue:
+			//upsert ssh channel
+			uc, err := u.getUDPChan(ctx)
+			if err != nil {
+				if strings.HasSuffix(err.Error(), "EOF") {
+					continue
+				}
+				u.Debugf("Failed to get UDP channel: %s", err)
+				atomic.AddInt64(&u.stats.FailedPackets, 1)
+				continue
+			}
+			//send over channel, including source address
+			if err := uc.encode(packet.Src, packet.Payload); err != nil {
+				if strings.HasSuffix(err.Error(), "EOF") {
+					// Channel closed, try to get a new one
+					u.outboundMut.Lock()
+					u.outbound = nil
+					u.outboundMut.Unlock()
+					// Retry with new channel
+					uc, err = u.getUDPChan(ctx)
+					if err != nil {
+						u.Debugf("Failed to get new UDP channel after EOF: %s", err)
+						atomic.AddInt64(&u.stats.FailedPackets, 1)
+						continue
+					}
+					// Retry sending
+					if err := uc.encode(packet.Src, packet.Payload); err != nil {
+						u.Debugf("Failed to resend packet after channel reset: %s", err)
+						atomic.AddInt64(&u.stats.FailedPackets, 1)
+						continue
+					}
+				} else {
+					u.Debugf("Failed to encode UDP packet: %s", err)
+					atomic.AddInt64(&u.stats.FailedPackets, 1)
+					continue
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (u *udpListener) unsetUDPChan(sshConn ssh.Conn) {
 	sshConn.Wait()
 	u.Debugf("lost channel")
 	u.outboundMut.Lock()
 	u.outbound = nil
 	u.outboundMut.Unlock()
+	atomic.AddInt32(&u.stats.ActiveChannels, -1)
 }

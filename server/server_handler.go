@@ -16,17 +16,24 @@ import (
 
 // handleClientHandler is the main http websocket handler for the chisel server
 func (s *Server) handleClientHandler(w http.ResponseWriter, r *http.Request) {
-	//websockets upgrade AND has chisel prefix
+	//websockets upgrade - accept masked protocol or no protocol
+	//Actual protocol verification happens via SSH custom request after handshake
 	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
 	protocol := r.Header.Get("Sec-WebSocket-Protocol")
 	if upgrade == "websocket" {
+		// Accept masked protocol or no protocol at all
+		// We'll verify it's actually chisel via SSH handshake and custom request
+		if protocol == chshare.MaskedWebSocketProtocol || protocol == "" {
+			s.handleWebsocket(w, r)
+			return
+		}
+		// Also accept original protocol for backward compatibility during transition
 		if protocol == chshare.ProtocolVersion {
 			s.handleWebsocket(w, r)
 			return
 		}
 		//print into server logs and silently fall-through
-		s.Infof("ignored client connection using protocol '%s', expected '%s'",
-			protocol, chshare.ProtocolVersion)
+		s.Debugf("ignored client connection using protocol '%s'", protocol)
 	}
 	//proxy target was provided
 	if s.reverseProxy != nil {
@@ -137,7 +144,7 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 	//tunnel per ssh connection
 	tunnel := tunnel.New(tunnel.Config{
 		Logger:    l,
-		Inbound:   s.config.Reverse,
+		Inbound:   s.config.Reverse, //server is inbound for reverse proxies
 		Outbound:  true, //server always accepts outbound
 		Socks:     s.config.Socks5,
 		KeepAlive: s.config.KeepAlive,
@@ -154,8 +161,9 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 		if len(serverInbound) == 0 {
 			return nil
 		}
-		//block
-		return tunnel.BindRemotes(ctx, serverInbound)
+		// In reverse proxy mode, server should NOT bind remotes
+		// Client will bind the reverse proxy ports locally
+		return nil
 	})
 	err = eg.Wait()
 	if err != nil && !strings.HasSuffix(err.Error(), "EOF") {

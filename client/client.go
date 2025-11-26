@@ -23,6 +23,7 @@ import (
 	"github.com/jpillora/chisel/share/cnet"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/chisel/share/tunnel"
+	"github.com/jpillora/chisel/share/traffic"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/net/proxy"
@@ -170,12 +171,23 @@ func NewClient(c *Config) (*Client, error) {
 			return nil, fmt.Errorf("Invalid proxy URL (%s)", err)
 		}
 	}
-	//ssh auth and config
+	
+	// Generate realistic HTTP headers to mask traffic (default: enabled at highest level)
+	// Merge with user-provided headers (user headers take precedence)
+	// Note: WebSocket library automatically adds Connection header, so we remove it to avoid duplicates
+	if c.Headers == nil {
+		c.Headers = make(http.Header)
+	}
+	realisticHeaders := traffic.GenerateRealisticHeaders()
+	// Remove Connection header to avoid duplicate with WebSocket library
+	realisticHeaders.Del("Connection")
+	c.Headers = traffic.MergeHeaders(c.Headers, realisticHeaders)
+	//ssh auth and config with masked version string
 	user, pass := settings.ParseAuth(c.Auth)
 	client.sshConfig = &ssh.ClientConfig{
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.Password(pass)},
-		ClientVersion:   "SSH-" + chshare.ProtocolVersion + "-client",
+		ClientVersion:   chshare.MaskedSSHClientVersion,
 		HostKeyCallback: client.verifyServer,
 		Timeout:         settings.EnvDuration("SSH_TIMEOUT", 30*time.Second),
 	}
@@ -258,6 +270,14 @@ func (c *Client) Start(ctx context.Context) error {
 			return nil
 		}
 		return c.tunnel.BindRemotes(ctx, clientInbound)
+	})
+	//bind reverse remotes
+	eg.Go(func() error {
+		clientReverse := c.computed.Remotes.Reversed(true)
+		if len(clientReverse) == 0 {
+			return nil
+		}
+		return c.tunnel.BindRemotes(ctx, clientReverse)
 	})
 	return nil
 }
